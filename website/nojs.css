@@ -1,0 +1,41 @@
+/* styles for when javascript is disabled */
+.noscript-notice {
+    display: block;
+    margin-top: 0.5rem;
+    background: none;
+    padding: 0;
+    width: 100%;
+    color: #d68910;
+    font-size: 0.875rem;
+    text-align: center;
+}
+
+.hero-demo {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin-bottom: 2rem;
+}
+
+.noscript-notice a {
+    color: #d68910;
+    text-decoration: underline;
+}
+
+/* hide typing cursor animation */
+.cursor {
+    display: none;
+}
+
+/* show full text without animation */
+.typed-words {
+    opacity: 1;
+}
+
+/* show fallback counter; hide real counter */
+.iine-button .counter-fallback {
+    display: inline;
+}
+.iine-button .counter {
+    display: none;
+}
