@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+
+function error_exit() {
+    echo "ERROR: $1" >&2
+    exit "${2:-1}"
+}
+
+function get_file_hash() {
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum "$1" | cut -d' ' -f1 | head -c 8
+    else
+        md5 -q "$1" | head -c 8
+    fi
+}
+
+function contains_todo() {
+    return 1
+    local file="$1"
+    grep -q "TODO" "$file"
+}
+
+function has_unstaged_changes() {
+    local file="$1"
+    [[ -n $(git diff -- "$file") ]]
+}
+
+# Files to watch for cache busting (relative to website/)
+WEBSITE_FILES_TO_CACHEBUST=(
+    "script.js"
+    "script.mini.js"
+    "styles.css"
+    "nojs.css"
+)
+
+# JavaScript files to minify (with their minified output paths)
+JS_FILES_TO_MINIFY=(
+    "iine.js"
+    "website/script.js"
+)
+
+# Check if oxipng is installed.
+png_compressor=""
+if command -v oxipng &> /dev/null; then
+    png_compressor="oxipng -o max"
+elif command -v optipng &> /dev/null; then
+    png_compressor="optipng -o 7"
+fi
+
+# Check if uglifyjs is installed.
+js_minifier=""
+if command -v uglifyjs &> /dev/null; then
+    js_minifier="uglifyjs --compress --mangle"
+fi
+
+# Get newly added and modified files.
+mapfile -t all_changed_files < <(git diff --cached --name-only --diff-filter=d)
+
+script_name=$(basename "$0")
+# Loop through all newly added or modified files.
+for file in "${all_changed_files[@]}"; do
+    file_name=$(basename "$file")
+
+    # Ignore this script and the changelog.
+    if [[ "$file_name" == "$script_name" ]] || [[ "$file_name" == "CHANGELOG.md" ]]; then
+        continue
+    fi
+
+    # If the file is a PNG and png_compressor is set, compress it and add it to the commit.
+    if [[ "$file" == *.png ]] && [[ -n "$png_compressor" ]]; then
+        $png_compressor "$file" || error_exit "Failed to compress PNG file $file"
+        git add --force "$file" || error_exit "Failed to add compressed PNG file $file"
+        continue
+    fi
+
+    # If the file is in JS_FILES_TO_MINIFY and js_minifier is set, create minified version.
+    if [[ " ${JS_FILES_TO_MINIFY[*]} " =~ \ ${file}\  ]] && [[ -n "$js_minifier" ]]; then
+        file_dir=$(dirname "$file")
+        file_name=$(basename "$file" .js)
+        if [[ "$file_dir" == "." ]]; then
+            minified_file="${file_name}.mini.js"
+        else
+            minified_file="${file_dir}/${file_name}.mini.js"
+        fi
+        $js_minifier -o "$minified_file" "$file" || error_exit "Failed to minify JavaScript file $file"
+        git add "$minified_file" || error_exit "Failed to add minified JavaScript file $minified_file"
+        echo "Created minified version: $minified_file"
+    fi
+
+    # If the file contains "TODO", abort the commit.
+    if contains_todo "$file"; then
+        error_exit "File $file contains TODO! Remove or complete the TODO before committing."
+    fi
+
+    if has_unstaged_changes "website/index.html"; then
+        error_exit "index.html has unstaged changes. Commit or stash them before proceeding."
+    fi
+
+    # Update cache busting ?urls in index.html.
+    file_without_prefix=${file#website/}
+    if [[ " ${WEBSITE_FILES_TO_CACHEBUST[*]} " =~ ${file_without_prefix} ]]; then
+        new_hash=$(get_file_hash "$file")
+        base_name=$(basename "$file")
+        perl -pi -e "s|${base_name}?[^\"]*\"|${base_name}?h=${new_hash}\"|g; s|${base_name}\"|${base_name}?h=${new_hash}\"|g" "website/index.html"
+        git add "website/index.html"
+        echo "Updated cache bust hash for $file to $new_hash"
+    fi
+done

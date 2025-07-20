@@ -1,0 +1,222 @@
+
+-- iine（いいね）: Self-hosted page hit counter setup for Supabase
+-- https://iine.to · https://github.com/welpo/iine
+-- Prerequisites: Enable `pg_cron` extension in Database → Extensions: https://supabase.com/dashboard/project/_/database/extensions
+-- Run this entire script in the Supabase SQL Editor
+
+-- Schema for iine
+create schema iine;
+
+--- HELPER FUNCTIONS ---
+create or replace function iine.canonicalize_domain(raw_domain text)
+returns text language plpgsql immutable set search_path = 'iine', 'public' as $$
+declare
+  cleaned_domain text;
+begin
+  if raw_domain is null or trim(raw_domain) = '' then
+    return null;
+  end if;
+  -- Remove protocol (http/https)
+  cleaned_domain := regexp_replace(raw_domain, 'https?://', '', 'i');
+  -- Remove 'www.' prefix
+  cleaned_domain := regexp_replace(cleaned_domain, '^www\.', '', 'i');
+  -- Remove port number
+  cleaned_domain := split_part(cleaned_domain, ':', 1);
+  -- To lowercase
+  cleaned_domain := lower(cleaned_domain);
+  return cleaned_domain;
+end;
+$$;
+
+create or replace function iine.canonicalize_slug(raw_slug text)
+returns text language plpgsql immutable set search_path = 'iine', 'public' as $$
+declare
+  cleaned_slug text;
+begin
+  cleaned_slug := split_part(raw_slug, '?', 1);
+  cleaned_slug := split_part(cleaned_slug, '#', 1);
+  cleaned_slug := lower(cleaned_slug);
+
+  if length(cleaned_slug) > 1 then
+    cleaned_slug := rtrim(cleaned_slug, '/');
+  end if;
+
+  if cleaned_slug = '' or cleaned_slug = '/' then
+    return '/';
+  else
+    return cleaned_slug;
+  end if;
+end;
+$$;
+
+--- TABLES AND TRIGGERS ---
+
+create table iine.counters (
+  origin_domain text not null,
+  slug text not null,
+  counter bigint not null default 1,
+  created_ts timestamptz not null default now(),
+  updated_ts timestamptz not null default now(),
+
+  constraint origin_domain_length_check check (length(origin_domain) <= 255),
+  constraint slug_length_check check (length(slug) <= 1024),
+  constraint slug_character_check check (slug ~ '^[[:alnum:]/_.%\-]*$'),
+
+  primary key (origin_domain, slug)
+);
+
+create table iine.rate_limits (
+  identifier_hash bigint primary key,
+  request_count int not null default 1
+);
+
+create or replace function iine.handle_updated_ts()
+returns trigger language plpgsql security definer set search_path = 'iine', 'public' as $$
+begin
+  new.updated_ts := now();
+  return new;
+end;
+$$;
+
+create trigger on_counters_update
+  before update on iine.counters
+  for each row execute function iine.handle_updated_ts();
+
+
+--- RATE LIMITING FUNCTION ---
+
+create or replace function iine.check_rate_limit(client_ip text)
+returns boolean language plpgsql security definer set search_path = 'iine', 'public' as $$
+declare
+  rate_limit_hash bigint;
+  current_count int;
+  max_requests int := 60;
+begin
+  if client_ip is null then
+    return false;
+  end if;
+
+  rate_limit_hash := hashtext(client_ip || date_trunc('hour', now())::text);
+
+  insert into iine.rate_limits (identifier_hash, request_count)
+  values (rate_limit_hash, 1)
+  on conflict (identifier_hash)
+  do update set request_count = rate_limits.request_count + 1
+  returning request_count into current_count;
+
+  return current_count > max_requests;
+end;
+$$;
+
+--- PUBLIC RPC FUNCTIONS ---
+create or replace function public.get_hits(page_slugs text[])
+returns jsonb language plpgsql security definer set search_path = 'iine', 'public' stable as $$
+declare
+  request_origin text := (current_setting('request.headers', true)::jsonb)->>'origin';
+  canonical_domain text;
+  max_slugs int := 20;
+begin
+  if request_origin is null then
+    return '{}'::jsonb;
+  end if;
+
+  if array_length(page_slugs, 1) > max_slugs then
+    raise exception 'Batch size exceeds the limit of % slugs.', max_slugs;
+  end if;
+
+  canonical_domain := iine.canonicalize_domain(request_origin);
+
+  return (
+    select jsonb_object_agg(s.slug, coalesce(c.counter, 0))
+    from unnest(page_slugs) as s(slug)
+    left join iine.counters c on (
+      c.origin_domain = canonical_domain and
+      c.slug = iine.canonicalize_slug(s.slug)
+    )
+  );
+end;
+$$;
+
+create or replace function public.increment_hits(page_slug text)
+returns text language plpgsql security definer set search_path = 'iine', 'public' as $$
+declare
+  request_headers jsonb := current_setting('request.headers', true)::jsonb;
+  request_origin text := coalesce(
+    request_headers->>'origin',    -- For JS requests
+    request_headers->>'referer'    -- For form submissions
+  );
+  client_ip text := request_headers->>'cf-connecting-ip'; -- Use real client IP, not spoofable x-forwarded-for.
+  request_user_agent text := request_headers->>'user-agent';
+  canonical_domain text;
+  canonical_slug text;
+  new_counter_value bigint;
+begin
+  if
+    request_origin is null or
+    page_slug is null or
+    request_user_agent is null
+  then
+    raise exception 'Invalid request.';
+  end if;
+
+  canonical_domain := iine.canonicalize_domain(request_origin);
+  canonical_slug := iine.canonicalize_slug(page_slug);
+
+  if iine.check_rate_limit(client_ip) then
+    return null;
+  end if;
+
+  insert into iine.counters (origin_domain, slug)
+  values (canonical_domain, canonical_slug)
+  on conflict (origin_domain, slug)
+  do update set
+    counter = counters.counter + 1
+  returning counter into new_counter_value;
+
+  return canonical_domain || canonical_slug || ' liked! ♥️️';
+end;
+$$;
+
+create or replace function public.status()
+returns jsonb language plpgsql security definer set search_path = 'iine', 'public' stable as $$
+begin
+  return jsonb_build_object('status', 'live');
+end;
+$$;
+
+--- SECURITY (RLS AND GRANTS) ---
+
+-- Enable RLS and default deny all access
+alter table iine.counters enable row level security;
+create policy "Deny all access" on iine.counters for all using (false) with check (false);
+
+alter table iine.rate_limits enable row level security;
+create policy "Deny all access" on iine.rate_limits for all using (false) with check (false);
+
+-- Grant permissions to the 'anon' role (public, unauthenticated users)
+grant usage on schema iine to anon;
+grant execute on function public.get_hits(text[]) to anon;
+grant execute on function public.increment_hits(text) to anon;
+grant execute on function public.status() to anon;
+
+--- RATE LIMITING CLEANUP ---
+
+-- SETUP INSTRUCTIONS:
+-- 1. Enable `pg_cron` extension in Supabase Dashboard: https://supabase.com/dashboard/project/_/database/extensions
+-- 2. Schedule hourly cleanup:
+
+select cron.schedule(
+  'hourly-rate-limit-cleanup',
+  '3 * * * *',
+  'truncate table iine.rate_limits;'
+);
+
+-- To verify the cron job is scheduled:
+select * from cron.job;
+
+-- You can check cron logs with:
+/*
+select *
+from cron.job_run_details
+order by start_time desc;
+*/
