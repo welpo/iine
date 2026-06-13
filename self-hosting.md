@@ -73,6 +73,36 @@ you can review the comments in the script for more information
 3. check your Supabase dashboard → table editor → `iine.counters`
 4. you should see a new row with your domain, `/test` slug, and counter = 1
 
+## self-hosting with plain PostgreSQL (without Supabase)
+
+you can run iine on your own PostgreSQL instance, but there's an important detail to understand first
+
+[PostgREST](https://postgrest.org) is the free, open-source server that turns a PostgreSQL database into the REST API your `iine.js` client already calls (those `/rest/v1/rpc/...` requests). Supabase just bundles it for you; on your own box you run it yourself
+
+the rpc functions read the request's origin, referer, ip, and user-agent from `current_setting('request.headers')`. that setting is populated by **[PostgREST](https://postgrest.org)**, the layer Supabase uses to expose your database over http. a raw `psql` session or a database driver does **not** set it, so `request_origin` comes back null and every `increment_hits` call fails with `Invalid request.`
+
+so a PostgreSQL-only setup still needs PostgREST in front of the database:
+
+1. install and run PostgreSQL, and create the `anon` role the grants target: `create role anon nologin;` (Supabase creates this role for you; plain PostgreSQL doesn't)
+2. run [`setup.psql`](./setup.psql). it's standard SQL. the rate-limit cleanup uses `pg_cron`, which you can install on plain PostgreSQL too (add it to `shared_preload_libraries`, then `create extension pg_cron;`); or remove the `cron.schedule(...)` call and run `truncate table iine.rate_limits;` from system cron instead
+3. run [PostgREST](https://postgrest.org/en/stable/install.html) pointed at your database with `db-anon-role = anon`, behind a reverse proxy (nginx, Caddy…) for TLS
+4. configure your client script as in [step 4](#step-4-configure-your-client-script) above (`SUPABASE_URL` = your proxy url; `SUPABASE_KEY` only matters if you set up PostgREST JWT auth; otherwise requests already map to `anon`)
+
+### rate limiting without Cloudflare
+
+the hosted iine runs behind Cloudflare, so `increment_hits` reads the real client ip from the `cf-connecting-ip` header. on a self-hosted setup that header doesn't exist, so `client_ip` is null, and `check_rate_limit` returns `false` (not rate limited) for a null ip, which means **rate limiting silently does nothing**
+
+if you want rate limiting, point the function at whatever header your reverse proxy sets the real client ip in (commonly `x-forwarded-for`), and only trust it because the request passes through *your* proxy:
+
+```sql
+-- in public.increment_hits, change:
+client_ip text := request_headers->>'cf-connecting-ip';
+-- to (for example):
+client_ip text := request_headers->>'x-forwarded-for';
+```
+
+make sure your proxy is configured to overwrite `x-forwarded-for` with the real client ip rather than appending to a client-supplied value, otherwise it can be spoofed
+
 ## monitoring & maintenance
 
 ### view your data
